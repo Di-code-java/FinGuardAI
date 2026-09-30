@@ -2,16 +2,47 @@ import aiohttp
 import statistics
 
 
-BINANCE_URL = "https://api.binance.com"
+COINGECKO_URL = "https://api.coingecko.com/api/v3"
 
 
-async def binance_request(endpoint, params=None):
+COIN_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "BNB": "binancecoin",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "ADA": "cardano",
+    "DOGE": "dogecoin",
+    "TRX": "tron",
+    "AVAX": "avalanche-2",
+    "DOT": "polkadot",
+    "LINK": "chainlink",
+    "MATIC": "matic-network",
+    "LTC": "litecoin",
+    "BCH": "bitcoin-cash",
+    "ATOM": "cosmos",
+    "ETC": "ethereum-classic",
+    "UNI": "uniswap",
+    "XLM": "stellar",
+    "NEAR": "near",
+    "APT": "aptos",
+}
 
-    url = BINANCE_URL + endpoint
 
-    timeout = aiohttp.ClientTimeout(total=10)
+async def coingecko_request(endpoint, params=None):
+    url = COINGECKO_URL + endpoint
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "FinGuardAI/1.0"
+    }
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=headers
+    ) as session:
 
         async with session.get(
             url,
@@ -19,30 +50,74 @@ async def binance_request(endpoint, params=None):
         ) as response:
 
             if response.status != 200:
+                text = await response.text()
+
                 raise Exception(
-                    f"Binance HTTP {response.status}"
+                    f"CoinGecko HTTP {response.status}: {text[:200]}"
                 )
 
             return await response.json()
 
 
-async def get_24h_ticker(symbol):
-
-    symbol = symbol.upper().replace(
-        "/", ""
+def get_coin_id(symbol):
+    symbol = (
+        symbol
+        .upper()
+        .replace("/", "")
+        .replace("-", "")
     )
 
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
+    if symbol.endswith("USDT"):
+        symbol = symbol[:-4]
 
-    data = await binance_request(
-        "/api/v3/ticker/24hr",
+    if symbol not in COIN_IDS:
+        raise Exception(
+            f"Актив {symbol} пока не поддерживается"
+        )
+
+    return symbol, COIN_IDS[symbol]
+
+
+async def get_24h_ticker(symbol):
+    symbol, coin_id = get_coin_id(symbol)
+
+    data = await coingecko_request(
+        "/simple/price",
         {
-            "symbol": symbol
+            "ids": coin_id,
+            "vs_currencies": "usd",
+            "include_24hr_change": "true",
+            "include_24hr_vol": "true",
+            "include_24hr_high": "true",
+            "include_24hr_low": "true"
         }
     )
 
-    return data
+    coin = data.get(coin_id)
+
+    if not coin:
+        raise Exception(
+            f"Не удалось получить данные для {symbol}"
+        )
+
+    return {
+        "symbol": symbol,
+        "price": float(
+            coin.get("usd", 0)
+        ),
+        "change_24h": float(
+            coin.get("usd_24h_change", 0)
+        ),
+        "volume": float(
+            coin.get("usd_24h_vol", 0)
+        ),
+        "high_24h": float(
+            coin.get("usd_24h_high", 0)
+        ),
+        "low_24h": float(
+            coin.get("usd_24h_low", 0)
+        )
+    }
 
 
 async def get_klines(
@@ -50,26 +125,52 @@ async def get_klines(
     interval="1h",
     limit=100
 ):
+    symbol, coin_id = get_coin_id(symbol)
 
-    symbol = symbol.upper().replace(
-        "/", ""
-    )
-
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
-
-    return await binance_request(
-        "/api/v3/klines",
+    data = await coingecko_request(
+        f"/coins/{coin_id}/market_chart",
         {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
+            "vs_currency": "usd",
+            "days": "7",
+            "interval": "hourly"
         }
     )
 
+    prices = data.get("prices", [])
+    volumes = data.get("total_volumes", [])
+
+    if not prices:
+        raise Exception(
+            f"Нет исторических данных для {symbol}"
+        )
+
+    prices = prices[-limit:]
+    volumes = volumes[-limit:]
+
+    candles = []
+
+    for i, price_data in enumerate(prices):
+        timestamp = price_data[0]
+        close = float(price_data[1])
+
+        if i < len(volumes):
+            volume = float(volumes[i][1])
+        else:
+            volume = 0
+
+        candles.append([
+            timestamp,
+            close,
+            close,
+            close,
+            close,
+            volume
+        ])
+
+    return candles
+
 
 def sma(values, period):
-
     if len(values) < period:
         return None
 
@@ -79,7 +180,6 @@ def sma(values, period):
 
 
 def ema(values, period):
-
     if len(values) < period:
         return None
 
@@ -90,7 +190,6 @@ def ema(values, period):
     ) / period
 
     for price in values[period:]:
-
         result = (
             price - result
         ) * multiplier + result
@@ -98,8 +197,10 @@ def ema(values, period):
     return result
 
 
-def calculate_rsi(values, period=14):
-
+def calculate_rsi(
+    values,
+    period=14
+):
     if len(values) < period + 1:
         return None
 
@@ -107,24 +208,28 @@ def calculate_rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
-
-        change = values[i] - values[i - 1]
+        change = (
+            values[i] - values[i - 1]
+        )
 
         if change >= 0:
             gains.append(change)
             losses.append(0)
-
         else:
             gains.append(0)
-            losses.append(abs(change))
+            losses.append(
+                abs(change)
+            )
 
-    avg_gain = sum(
-        gains[-period:]
-    ) / period
+    avg_gain = (
+        sum(gains[-period:])
+        / period
+    )
 
-    avg_loss = sum(
-        losses[-period:]
-    ) / period
+    avg_loss = (
+        sum(losses[-period:])
+        / period
+    )
 
     if avg_loss == 0:
         return 100
@@ -137,44 +242,36 @@ def calculate_rsi(values, period=14):
 
 
 def calculate_volatility(values):
-
     if len(values) < 2:
         return 0
 
     returns = []
 
     for i in range(1, len(values)):
-
         if values[i - 1] == 0:
             continue
 
         returns.append(
-            (values[i] / values[i - 1] - 1)
-            * 100
+            (
+                values[i]
+                / values[i - 1]
+                - 1
+            ) * 100
         )
 
     if len(returns) < 2:
         return 0
 
-    return statistics.stdev(returns)
+    return statistics.stdev(
+        returns
+    )
 
 
 async def get_price(symbol):
-
-    ticker = await get_24h_ticker(symbol)
-
-    return {
-        "symbol": ticker["symbol"],
-        "price": float(ticker["lastPrice"]),
-        "change_24h": float(ticker["priceChangePercent"]),
-        "volume": float(ticker["volume"]),
-        "high_24h": float(ticker["highPrice"]),
-        "low_24h": float(ticker["lowPrice"]),
-    }
+    return await get_24h_ticker(symbol)
 
 
 async def get_market_analysis(symbol):
-
     ticker = await get_price(symbol)
 
     candles = await get_klines(
@@ -193,20 +290,47 @@ async def get_market_analysis(symbol):
         for candle in candles
     ]
 
+    if not closes:
+        raise Exception(
+            "Исторические данные отсутствуют"
+        )
+
     current_price = closes[-1]
 
-    sma20 = sma(closes, 20)
-    sma50 = sma(closes, 50)
+    sma20 = sma(
+        closes,
+        20
+    )
 
-    ema20 = ema(closes, 20)
+    sma50 = sma(
+        closes,
+        50
+    )
 
-    rsi = calculate_rsi(closes)
+    ema20 = ema(
+        closes,
+        20
+    )
 
-    volatility = calculate_volatility(closes)
+    rsi = calculate_rsi(
+        closes
+    )
 
-    avg_volume = sum(
-        volumes[-20:]
-    ) / min(20, len(volumes))
+    volatility = calculate_volatility(
+        closes
+    )
+
+    volume_period = min(
+        20,
+        len(volumes)
+    )
+
+    avg_volume = (
+        sum(
+            volumes[-volume_period:]
+        )
+        / volume_period
+    )
 
     volume_ratio = (
         volumes[-1] / avg_volume
@@ -214,10 +338,16 @@ async def get_market_analysis(symbol):
         else 0
     )
 
-    if sma20 and current_price > sma20:
+    if (
+        sma20 is not None
+        and current_price > sma20
+    ):
         trend = "Восходящий"
 
-    elif sma20 and current_price < sma20:
+    elif (
+        sma20 is not None
+        and current_price < sma20
+    ):
         trend = "Нисходящий"
 
     else:
@@ -231,10 +361,12 @@ async def get_market_analysis(symbol):
     elif volume_ratio > 1.5:
         anomaly_score += 15
 
-    if abs(ticker["change_24h"]) > 10:
+    change_24h = ticker["change_24h"]
+
+    if abs(change_24h) > 10:
         anomaly_score += 30
 
-    elif abs(ticker["change_24h"]) > 5:
+    elif abs(change_24h) > 5:
         anomaly_score += 15
 
     if volatility > 5:
@@ -247,17 +379,12 @@ async def get_market_analysis(symbol):
 
     return {
         **ticker,
-
         "sma20": sma20,
         "sma50": sma50,
         "ema20": ema20,
-
         "rsi": rsi,
         "volatility": volatility,
-
         "volume_ratio": volume_ratio,
-
         "trend": trend,
-
         "anomaly_score": anomaly_score
     }
